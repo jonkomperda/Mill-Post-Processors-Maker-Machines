@@ -4,13 +4,13 @@
 
   ShopBot OpenSBP post processor configuration.
 
-  $Revision: 36361 $
-  $Date: 2014-01-21 09:26:20 +0100 (ti, 21 jan 2014) $
+  $Revision: 37975 $
+  $Date: 2014-10-19 02:07:48 +0200 (sø, 19 okt 2014) $
   
   FORKID {866F31A2-119D-485c-B228-090CC89C9BE8}
 */
 
-description = "GitHub - ShopBot OpenSBP";
+description = "ShopBot OpenSBP";
 vendor = "Autodesk, Inc.";
 vendorUrl = "http://www.autodesk.com";
 legal = "Copyright (C) 2012-2014 by Autodesk, Inc.";
@@ -38,17 +38,36 @@ properties = {
   useToolChanger: false // specifies that a tool changer is available
 };
 
+function CustomVariable(specifiers, format) {
+  if (!(this instanceof arguments.callee)) {
+    throw new Error(localize("CustomVariable constructor called as a function."));
+  }
+  this.variable = createVariable(specifiers, format);
+  this.offset = 0;
+}
+
+CustomVariable.prototype.format = function (value) {
+  return this.variable.format(value + this.offset);
+};
+
+CustomVariable.prototype.reset = function () {
+  return this.variable.reset();
+};
+
 var xyzFormat = createFormat({decimals:(unit == MM ? 3 : 4)});
 var abcFormat = createFormat({decimals:3, scale:DEG});
 var feedFormat = createFormat({decimals:(unit == MM ? 0 : 1)});
 var secFormat = createFormat({decimals:2}); // seconds
 
-var xOutput = createVariable({force:true}, xyzFormat);
-var yOutput = createVariable({force:true}, xyzFormat);
-var zOutput = createVariable({force:true}, xyzFormat);
+var xOutput = new CustomVariable({force:true}, xyzFormat);
+var yOutput = new CustomVariable({force:true}, xyzFormat);
+var zOutput = new CustomVariable({force:true}, xyzFormat);
 var aOutput = createVariable({force:true}, abcFormat);
 var bOutput = createVariable({force:true}, abcFormat);
 var feedOutput = createVariable({}, feedFormat);
+
+// the gauge length + the tool length
+var pivotDistance = toPreciseUnit(6.0 /*6.0 + 2.5*/, IN); // 2.5in is assumed for the tool length
 
 /**
   Writes the specified block.
@@ -74,12 +93,12 @@ function writeComment(text) {
 function onOpen() {
 
   if (false) { // note: setup your machine here
-    var aAxis = createAxis({coordinate:0, table:false, axis:[1, 0, 0], range:[-360,360], preference:1});
-    var bAxis = createAxis({coordinate:1, table:false, axis:[0, 0, 1], range:[-360,360], preference:1});
-    machineConfiguration = new MachineConfiguration(aAxis, bAxis);
+    var aAxis = createAxis({coordinate:0, table:false, axis:[0, 0, 1], range:[-360,360], cyclic:true, preference:1});
+    var bAxis = createAxis({coordinate:1, table:false, axis:[1, 0, 0], range:[-120,120], preference:1});
+    machineConfiguration = new MachineConfiguration(bAxis, aAxis);
 
     setMachineConfiguration(machineConfiguration);
-    optimizeMachineAngles2(0); // TCP mode
+    optimizeMachineAngles2(0); // TCP mode - we compensate below
   }
 
   if (!machineConfiguration.isMachineCoordinate(0)) {
@@ -107,7 +126,7 @@ function onOpen() {
     break;
   };
 
-/*  
+/*
   if (hasParameter("operation:clearanceHeightOffset")) {
     var safeZ = getParameter("operation:clearanceHeightOffset");
     writeln("&PWSafeZ = " + safeZ);
@@ -122,11 +141,31 @@ function onOpen() {
     writeln("&PWZorigin = Table Surface");
   } else {
     writeln("&PWZorigin = Part Surface");
-	}
+  }
 }
 
 function onComment(message) {
   writeComment(message);
+}
+
+/** Force output of X, Y, and Z. */
+function forceXYZ() {
+  xOutput.reset();
+  yOutput.reset();
+  zOutput.reset();
+}
+
+/** Force output of A, B, and C. */
+function forceABC() {
+  aOutput.reset();
+  bOutput.reset();
+}
+
+/** Force output of X, Y, Z, A, B, C, and F on next output. */
+function forceAny() {
+  forceXYZ();
+  forceABC();
+  feedOutput.reset();
 }
 
 function onParameter(name, value) {
@@ -220,13 +259,15 @@ function getWorkPlaneMachineABC(workPlane) {
   return abc;
 }
 
+var headOffset = 0;
+
 function onSection() {
   var insertToolCall = isFirstSection() ||
     currentSection.getForceToolChange && currentSection.getForceToolChange() ||
     (tool.number != getPreviousSection().getTool().number);
   
   writeln("");
-  
+
   if (hasParameter("operation-comment")) {
     var comment = getParameter("operation-comment");
     if (comment) {
@@ -283,7 +324,7 @@ function onSection() {
         (tool.number != getPreviousSection().getTool().number)){
       writeln("&Tool = " + tool.number);
       writeln("C9");
-        
+      
       if (tool.spindleRPM < 1) {
         error(localize("Spindle speed out of range."));
         return;
@@ -293,8 +334,8 @@ function onSection() {
       }
 
       writeBlock("TR", tool.spindleRPM);
-	    writeln("C6");
-	  }
+      writeln("C6");
+    }
     if (tool.comment) {
       writeln("&ToolName = " + tool.comment);
     }
@@ -303,6 +344,24 @@ function onSection() {
   if (!properties.useToolChanger) {
     writeBlock("PAUSE"); // wait for user
   }
+
+  headOffset = /*tool.bodyLength +*/ pivotDistance; // control will compensate for tool length
+
+  if (true) {
+    var displacement = currentSection.getGlobalInitialToolAxis();
+    // var displacement = currentSection.workPlane.forward;
+    displacement.multiply(headOffset);
+    displacement = Vector.diff(displacement, new Vector(0, 0, headOffset));
+    // writeComment("DISPLACEMENT: X" + xyzFormat.format(displacement.x) + " Y" + xyzFormat.format(displacement.y) + " Z" + xyzFormat.format(displacement.z));
+    // setTranslation(displacement);
+
+    // temporary solution
+    xOutput.offset = displacement.x;
+    yOutput.offset = displacement.y;
+    zOutput.offset = displacement.z;
+  }
+
+  forceAny();
 
   var initialPosition = getFramePosition(currentSection.getInitialPosition());
   var retracted = false;
@@ -320,11 +379,21 @@ function onSection() {
       zOutput.format(initialPosition.z)
     );
   }
+
+  if (currentSection.isMultiAxis()) {
+    xOutput.offset = 0;
+    yOutput.offset = 0;
+    zOutput.offset = 0;
+  }
 }
 
 function onDwell(seconds) {
   seconds = clamp(0.01, seconds, 99999);
   writeBlock("PAUSE", secFormat.format(seconds));
+}
+
+function onSpindleSpeed(spindleSpeed) {
+  writeBlock("TR", spindleSpeed);
 }
 
 function onRadiusCompensation() {
@@ -353,18 +422,48 @@ function onLinear(_x, _y, _z, feed) {
 }
 
 function onRapid5D(_x, _y, _z, _a, _b, _c) {
-  var x = xOutput.format(_x);
-  var y = yOutput.format(_y);
-  var z = zOutput.format(_z);
+  var x;
+  var y;
+  var z;
+  if (true) {
+    // TAG: need extra points
+    var displacement = machineConfiguration.getDirection(new Vector(_a, _b, _c));
+    displacement.multiply(headOffset); // control will compensate for tool length
+    displacement = Vector.diff(displacement, new Vector(0, 0, headOffset));
+    // writeComment("DISPLACEMENT: X" + xyzFormat.format(displacement.x) + " Y" + xyzFormat.format(displacement.y) + " Z" + xyzFormat.format(displacement.z));
+    x = xOutput.format(_x + displacement.x);
+    y = yOutput.format(_y + displacement.y);
+    z = zOutput.format(_z + displacement.z);
+  } else {
+    x = xOutput.format(_x);
+    y = yOutput.format(_y);
+    z = zOutput.format(_z);
+  }
+
   var a = aOutput.format(_a);
   var b = bOutput.format(_b);
   writeBlock("J5", x, y, z, a, b);
 }
 
 function onLinear5D(_x, _y, _z, _a, _b, _c, feed) {
-  var x = xOutput.format(_x);
-  var y = yOutput.format(_y);
-  var z = zOutput.format(_z);
+  var x;
+  var y;
+  var z;
+  if (true) {
+    // TAG: need extra points
+    var displacement = machineConfiguration.getDirection(new Vector(_a, _b, _c));
+    displacement.multiply(headOffset); // control will compensate for tool length
+    displacement = Vector.diff(displacement, new Vector(0, 0, headOffset));
+    // writeComment("DISPLACEMENT: X" + xyzFormat.format(displacement.x) + " Y" + xyzFormat.format(displacement.y) + " Z" + xyzFormat.format(displacement.z));
+    x = xOutput.format(_x + displacement.x);
+    y = yOutput.format(_y + displacement.y);
+    z = zOutput.format(_z + displacement.z);
+  } else {
+    x = xOutput.format(_x);
+    y = yOutput.format(_y);
+    z = zOutput.format(_z);
+  }
+
   var a = aOutput.format(_a);
   var b = bOutput.format(_b);
   var f = feedOutput.format(feed/60);
@@ -403,6 +502,10 @@ function onCommand(command) {
 
 function onSectionEnd() {
   writeln("C7");
+  xOutput.offset = 0;
+  yOutput.offset = 0;
+  zOutput.offset = 0;
+  forceAny();
 }
 
 function onClose() {
